@@ -3,15 +3,83 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const MAX_FILE_SIZE = (parseInt(process.env.MAX_FILE_SIZE_MB) || 10) * 1024 * 1024;
 const DEFAULT_PROVIDER = process.env.DEFAULT_PROVIDER || 'gemini';
 
+// ── Security config ──
+const API_KEY = process.env.API_KEY || '';
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX) || 30;
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
+const MAX_PROMPT_LENGTH = parseInt(process.env.MAX_PROMPT_LENGTH) || 2000;
+const CORS_ORIGINS = process.env.CORS_ORIGINS || '*';
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS) || 30 * 1000;
+
+// ── In-memory per-IP rate limiter ──
+const rateLimitStore = new Map();
+
+// Clean up expired entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitStore) {
+    if (now - entry.resetTime > RATE_LIMIT_WINDOW_MS) {
+      rateLimitStore.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+function rateLimiter(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const entry = rateLimitStore.get(ip);
+
+  if (!entry || now - entry.resetTime > RATE_LIMIT_WINDOW_MS) {
+    rateLimitStore.set(ip, { count: 1, resetTime: now });
+    return next();
+  }
+
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX) {
+    res.set('Retry-After', String(Math.ceil((RATE_LIMIT_WINDOW_MS - (now - entry.resetTime)) / 1000)));
+    return res.status(429).json({
+      success: false,
+      error: 'Rate limit exceeded. Try again later.'
+    });
+  }
+  next();
+}
+
+// ── Auth middleware (disabled if API_KEY is empty) ──
+function authMiddleware(req, res, next) {
+  if (!API_KEY) return next();
+
+  const auth = req.headers.authorization;
+  if (!auth || auth !== `Bearer ${API_KEY}`) {
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized. Provide a valid API key via Authorization: Bearer <key> header.'
+    });
+  }
+  next();
+}
+
+// ── Security headers ──
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('X-XSS-Protection', '1; mode=block');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.removeHeader('X-Powered-By');
+  next();
+});
+
 // ── Middleware ──
-app.use(cors());
+const corsOptions = CORS_ORIGINS === '*'
+  ? { origin: true }
+  : { origin: CORS_ORIGINS.split(',').map(s => s.trim()) };
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '1mb' }));
 
 // ── Multer (memory storage — no temp files) ──
@@ -20,10 +88,32 @@ const upload = multer({
   limits: { fileSize: MAX_FILE_SIZE },
   fileFilter: (req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-    if (allowed.includes(file.mimetype)) return cb(null, true);
-    cb(new Error(`Unsupported file type: ${file.mimetype}`));
+    if (!allowed.includes(file.mimetype)) {
+      return cb(new Error(`Unsupported file type: ${file.mimetype}`));
+    }
+    cb(null, true);
   }
 });
+
+// ── Magic-byte image validation (prevents MIME spoofing) ──
+function validateImageMagicBytes(buffer, mimetype) {
+  if (!buffer || buffer.length < 12) return false;
+
+  switch (mimetype) {
+    case 'image/jpeg':
+      return buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
+    case 'image/png':
+      return buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47
+          && buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A;
+    case 'image/gif':
+      return buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38;
+    case 'image/webp':
+      return buffer.slice(0, 4).toString('ascii') === 'RIFF'
+          && buffer.slice(8, 12).toString('ascii') === 'WEBP';
+    default:
+      return false;
+  }
+}
 
 // ── OCR Prompt ──
 const DEFAULT_PROMPT = `Extract all information from this receipt image. Return ONLY valid JSON (no markdown, no code fences) with these fields:
@@ -60,21 +150,32 @@ async function ocrGemini(imageBuffer, mimeType, prompt) {
     }
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini API ${res.status}: ${err}`);
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal }
+    );
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`[Gemini] ${res.status}: ${err.slice(0, 500)}`);
+      throw new Error(`Upstream API error`);
+    }
+
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error('Upstream returned empty response');
+
+    return parseJSON(text);
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Upstream request timed out');
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const data = await res.json();
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('Gemini returned empty response');
-
-  return parseJSON(text);
 }
 
 // ── Provider: GLM (z.ai) ──
@@ -99,28 +200,40 @@ async function ocrGLM(imageBuffer, mimeType, prompt) {
     max_tokens: 2048
   };
 
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(body)
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`GLM API ${res.status}: ${err}`);
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`[GLM] ${res.status}: ${err.slice(0, 500)}`);
+      throw new Error(`Upstream API error`);
+    }
+
+    const data = await res.json();
+    // GLM-4.6V returns answers in reasoning_content, not content
+    const text = data?.choices?.[0]?.message?.content
+      || data?.choices?.[0]?.message?.reasoning_content
+      || '';
+    if (!text) throw new Error('Upstream returned empty response');
+
+    return parseJSON(text);
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Upstream request timed out');
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const data = await res.json();
-  // GLM-4.6V returns answers in reasoning_content, not content
-  const text = data?.choices?.[0]?.message?.content
-    || data?.choices?.[0]?.message?.reasoning_content
-    || '';
-  if (!text) throw new Error('GLM returned empty response');
-
-  return parseJSON(text);
 }
 
 // ── JSON Parser (handles markdown fences, extra text) ──
@@ -150,7 +263,7 @@ function parseJSON(text) {
 
 // ── Routes ──
 
-// Health check
+// Health check (no auth, no rate limit — needed for monitoring)
 app.get('/api/health', (req, res) => {
   const providers = getProviders();
   res.json({
@@ -162,7 +275,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// List providers
+// List providers (no auth, no rate limit — config info only)
 app.get('/api/providers', (req, res) => {
   res.json(getProviders());
 });
@@ -180,15 +293,25 @@ function getProviders() {
   };
 }
 
-// OCR endpoint
-app.post('/api/ocr', upload.single('image'), async (req, res) => {
+// OCR endpoint — auth + rate limited
+app.post('/api/ocr', authMiddleware, rateLimiter, upload.single('image'), async (req, res) => {
   const start = Date.now();
 
   if (!req.file) {
     return res.status(400).json({ success: false, error: 'No image file provided. Use multipart form with "image" field.' });
   }
 
+  // Validate file magic bytes (prevents MIME-type spoofing)
+  if (!validateImageMagicBytes(req.file.buffer, req.file.mimetype)) {
+    return res.status(400).json({ success: false, error: `File content does not match declared type: ${req.file.mimetype}` });
+  }
+
+  // Validate prompt length
   const prompt = req.body.prompt || DEFAULT_PROMPT;
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    return res.status(400).json({ success: false, error: `Prompt too long. Maximum ${MAX_PROMPT_LENGTH} characters.` });
+  }
+
   let provider = (req.body.provider || DEFAULT_PROVIDER).toLowerCase();
 
   if (provider !== 'gemini' && provider !== 'glm') {
@@ -236,7 +359,7 @@ app.post('/api/ocr', upload.single('image'), async (req, res) => {
     console.error(`[OCR] Error: ${err.message}`);
     res.status(500).json({
       success: false,
-      error: err.message
+      error: err.message.includes('Upstream') ? 'Upstream API error. Check server logs for details.' : err.message
     });
   }
 });
@@ -245,7 +368,14 @@ app.post('/api/ocr', upload.single('image'), async (req, res) => {
 app.listen(PORT, () => {
   const providers = getProviders();
   const ready = Object.values(providers).filter(p => p.ready).map(p => p.model);
-  console.log(`\n  📸 OCR Service running on port ${PORT}`);
-  console.log(`  📦 Providers ready: ${ready.length > 0 ? ready.join(', ') : 'NONE — set API keys in .env'}`);
-  console.log(`  🔑 Default: ${DEFAULT_PROVIDER}\n`);
+  console.log(`\n  OCR Service running on port ${PORT}`);
+  console.log(`  Providers ready: ${ready.length > 0 ? ready.join(', ') : 'NONE — set API keys in .env'}`);
+  console.log(`  Default: ${DEFAULT_PROVIDER}`);
+  if (API_KEY) {
+    console.log(`  Auth: ENABLED (bearer token)`);
+  } else {
+    console.log(`  Auth: DISABLED (set API_KEY to enable)`);
+  }
+  console.log(`  Rate limit: ${RATE_LIMIT_MAX} requests / ${RATE_LIMIT_WINDOW_MS / 1000}s per IP`);
+  console.log(`  Max file size: ${MAX_FILE_SIZE / 1024 / 1024}MB\n`);
 });
