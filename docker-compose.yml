@@ -1,0 +1,13 @@
+services:
+  ocr-service:
+    build: .
+    container_name: ocr-service
+    restart: unless-stopped
+    ports:
+      - "3002:3002"
+    env_file:
+      - .env
+    environment:
+      - PORT=3002
+    volumes:
+      - ./data:/app/data
