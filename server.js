@@ -10,7 +10,7 @@ const MAX_FILE_SIZE = (parseInt(process.env.MAX_FILE_SIZE_MB) || 10) * 1024 * 10
 
 // ── Gemini model fallback chain ──
 // First model that succeeds wins. Add/remove/reorder as needed.
-const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-2.5-flash,gemini-2.5-flash-lite').split(',').map(s => s.trim()).filter(Boolean);
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-2.5-flash-lite,gemini-2.5-flash').split(',').map(s => s.trim()).filter(Boolean);
 
 // ── Security config ──
 const API_KEY = process.env.API_KEY || '';
