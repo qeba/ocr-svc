@@ -235,6 +235,38 @@ function parseJSON(text) {
   }
 }
 
+// ── Robots.txt (block all crawlers) ──
+app.get('/robots.txt', (req, res) => {
+  res.set('Content-Type', 'text/plain');
+  res.send('User-agent: *\nDisallow: /\n');
+});
+
+// ── Landing page (disguise) ──
+app.get('/', (req, res) => {
+  res.set('Content-Type', 'text/html');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cloud Services</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f8f9fa; color: #333; }
+    .container { text-align: center; padding: 2rem; }
+    h1 { font-size: 1.5rem; font-weight: 500; margin-bottom: 0.5rem; }
+    p { color: #666; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Cloud Services</h1>
+    <p>Internal infrastructure endpoint. No public access available.</p>
+  </div>
+</body>
+</html>`);
+});
+
 // ── Routes ──
 
 app.get('/api/health', (req, res) => {
@@ -246,15 +278,9 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.get('/api/providers', (req, res) => {
-  res.json({
-    gemini: {
-      ready: !!process.env.GEMINI_API_KEY,
-      models: GEMINI_MODELS,
-      fallback_chain: GEMINI_MODELS
-    }
-  });
-});
+// List providers — removed (leaks model info)
+// app.get('/api/providers', ...);
+
 
 app.post('/api/ocr', authMiddleware, rateLimiter, upload.single('image'), async (req, res) => {
   const start = Date.now();
@@ -298,6 +324,12 @@ app.post('/api/ocr', authMiddleware, rateLimiter, upload.single('image'), async 
       error: err.message.includes('Upstream') ? 'Upstream API error. Check server logs for details.' : err.message
     });
   }
+});
+
+// ── Catch-all 404 (generic, no API info leakage) ──
+app.use((req, res) => {
+  res.status(404).set('Content-Type', 'text/html');
+  res.send('<!DOCTYPE html><html><head><meta name="robots" content="noindex,nofollow"><title>404</title></head><body><h1>Not Found</h1></body></html>');
 });
 
 // ── Start ──
