@@ -201,7 +201,9 @@ async function ocrGemini(imageBuffer, mimeType, prompt) {
     } catch (err) {
       errors.push({ model, ...err });
       console.warn(`[OCR] ${model} failed: ${err.message} (retryable: ${err.retryable})`);
-      if (!err.retryable) break; // non-retryable errors (auth, safety) — don't bother trying next model
+      // Always try next model on transient/safety errors.
+      // Only abort immediately on auth (400) since it affects all models.
+      if (!err.retryable && err.status === 400) break;
     }
   }
 
