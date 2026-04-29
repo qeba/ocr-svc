@@ -7,7 +7,10 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3001;
 const MAX_FILE_SIZE = (parseInt(process.env.MAX_FILE_SIZE_MB) || 10) * 1024 * 1024;
-const DEFAULT_PROVIDER = process.env.DEFAULT_PROVIDER || 'gemini';
+
+// ── Gemini model fallback chain ──
+// First model that succeeds wins. Add/remove/reorder as needed.
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-2.5-flash,gemini-2.5-flash-lite').split(',').map(s => s.trim()).filter(Boolean);
 
 // ── Security config ──
 const API_KEY = process.env.API_KEY || '';
@@ -20,7 +23,6 @@ const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS) || 30 * 1000
 // ── In-memory per-IP rate limiter ──
 const rateLimitStore = new Map();
 
-// Clean up expired entries every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of rateLimitStore) {
@@ -128,12 +130,8 @@ const DEFAULT_PROMPT = `Extract all information from this receipt image. Return 
 
 If a field cannot be determined, use null. Be precise with numbers.`;
 
-// ── Provider: Gemini ──
-async function ocrGemini(imageBuffer, mimeType, prompt) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
-
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// ── Provider: Gemini (with model fallback chain) ──
+async function callGeminiModel(model, imageBuffer, mimeType, prompt, apiKey) {
   const base64 = imageBuffer.toString('base64');
 
   const body = {
@@ -161,42 +159,72 @@ async function ocrGemini(imageBuffer, mimeType, prompt) {
 
     if (!res.ok) {
       const err = await res.text();
-      console.error(`[Gemini] ${res.status}: ${err.slice(0, 500)}`);
-      throw new Error(`Upstream API error`);
+      const status = res.status;
+      console.error(`[Gemini/${model}] ${status}: ${err.slice(0, 300)}`);
+      // Return structured error so caller can decide to retry
+      const isRetryable = [429, 500, 502, 503].includes(status);
+      throw { retryable: isRetryable, status, message: `HTTP ${status}` };
     }
 
     const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Upstream returned empty response');
 
-    return parseJSON(text);
+    // Check for empty/finishReason issues
+    const candidate = data?.candidates?.[0];
+    if (candidate?.finishReason === 'SAFETY') {
+      throw { retryable: false, status: 400, message: 'Content blocked by safety filter' };
+    }
+
+    const text = candidate?.content?.parts?.[0]?.text;
+    if (!text) throw { retryable: true, status: 204, message: 'Empty response from model' };
+
+    return { model, data: parseJSON(text) };
   } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Upstream request timed out');
-    throw err;
+    if (err.name === 'AbortError') throw { retryable: true, status: 0, message: 'Request timed out' };
+    if (err.retryable !== undefined) throw err; // already structured
+    throw { retryable: false, status: 0, message: err.message };
   } finally {
     clearTimeout(timeout);
   }
 }
 
+async function ocrGemini(imageBuffer, mimeType, prompt) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
 
+  const errors = [];
+
+  for (const model of GEMINI_MODELS) {
+    try {
+      console.log(`[OCR] Trying Gemini model: ${model}`);
+      const result = await callGeminiModel(model, imageBuffer, mimeType, prompt, apiKey);
+      return result;
+    } catch (err) {
+      errors.push({ model, ...err });
+      console.warn(`[OCR] ${model} failed: ${err.message} (retryable: ${err.retryable})`);
+      if (!err.retryable) break; // non-retryable errors (auth, safety) — don't bother trying next model
+    }
+  }
+
+  // All models failed
+  const lastErr = errors[errors.length - 1];
+  console.error(`[OCR] All ${errors.length} model(s) failed. Errors:`, errors.map(e => `${e.model}: ${e.message}`));
+  throw new Error(`All models failed. Tried: ${errors.map(e => e.model).join(', ')}. Last error: ${lastErr.message}`);
+}
 
 // ── JSON Parser (handles markdown fences, extra text) ──
 function parseJSON(text) {
-  // Strip markdown code fences
   let cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
 
-  // Try to find JSON object in the text
   const match = cleaned.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('No JSON found in response');
 
   try {
     return JSON.parse(match[0]);
   } catch (e) {
-    // Try to fix common issues
     let fixed = match[0]
-      .replace(/,\s*}/g, '}')     // trailing commas
-      .replace(/,\s*]/g, ']')     // trailing commas in arrays
-      .replace(/'/g, '"');        // single quotes
+      .replace(/,\s*}/g, '}')
+      .replace(/,\s*]/g, ']')
+      .replace(/'/g, '"');
     try {
       return JSON.parse(fixed);
     } catch (e2) {
@@ -207,33 +235,25 @@ function parseJSON(text) {
 
 // ── Routes ──
 
-// Health check (no auth, no rate limit — needed for monitoring)
 app.get('/api/health', (req, res) => {
-  const providers = getProviders();
   res.json({
     status: 'ok',
     uptime: process.uptime(),
-    providers: Object.fromEntries(
-      Object.entries(providers).map(([k, v]) => [k, { ready: v.ready, model: v.model }])
-    )
+    models: GEMINI_MODELS,
+    provider: 'gemini'
   });
 });
 
-// List providers (no auth, no rate limit — config info only)
 app.get('/api/providers', (req, res) => {
-  res.json(getProviders());
-});
-
-function getProviders() {
-  return {
+  res.json({
     gemini: {
       ready: !!process.env.GEMINI_API_KEY,
-      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+      models: GEMINI_MODELS,
+      fallback_chain: GEMINI_MODELS
     }
-  };
-}
+  });
+});
 
-// OCR endpoint — auth + rate limited
 app.post('/api/ocr', authMiddleware, rateLimiter, upload.single('image'), async (req, res) => {
   const start = Date.now();
 
@@ -241,37 +261,32 @@ app.post('/api/ocr', authMiddleware, rateLimiter, upload.single('image'), async 
     return res.status(400).json({ success: false, error: 'No image file provided. Use multipart form with "image" field.' });
   }
 
-  // Validate file magic bytes (prevents MIME-type spoofing)
   if (!validateImageMagicBytes(req.file.buffer, req.file.mimetype)) {
     return res.status(400).json({ success: false, error: `File content does not match declared type: ${req.file.mimetype}` });
   }
 
-  // Validate prompt length
   const prompt = req.body.prompt || DEFAULT_PROMPT;
   if (prompt.length > MAX_PROMPT_LENGTH) {
     return res.status(400).json({ success: false, error: `Prompt too long. Maximum ${MAX_PROMPT_LENGTH} characters.` });
   }
-
-  const provider = 'gemini';
 
   if (!process.env.GEMINI_API_KEY) {
     return res.status(503).json({ success: false, error: 'GEMINI_API_KEY not configured.' });
   }
 
   try {
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    console.log(`[OCR] Using Gemini: ${model}`);
-    const data = await ocrGemini(req.file.buffer, req.file.mimetype, prompt);
-
+    const result = await ocrGemini(req.file.buffer, req.file.mimetype, prompt);
     const duration = Date.now() - start;
-    console.log(`[OCR] ${provider}/${model} — ${duration}ms`);
+
+    console.log(`[OCR] Success: ${result.model} — ${duration}ms`);
 
     res.json({
       success: true,
-      provider,
-      model,
+      provider: 'gemini',
+      model: result.model,
+      models_tried: GEMINI_MODELS.length,
       duration_ms: duration,
-      data
+      data: result.data
     });
 
   } catch (err) {
@@ -285,10 +300,9 @@ app.post('/api/ocr', authMiddleware, rateLimiter, upload.single('image'), async 
 
 // ── Start ──
 app.listen(PORT, () => {
-  const providers = getProviders();
-  const ready = Object.values(providers).filter(p => p.ready).map(p => p.model);
   console.log(`\n  OCR Service running on port ${PORT}`);
-  console.log(`  Provider: ${ready.length > 0 ? ready.join(', ') : 'NONE — set GEMINI_API_KEY in .env'}`);
+  console.log(`  Provider: gemini`);
+  console.log(`  Model fallback chain: ${GEMINI_MODELS.join(' → ')}`);
   if (API_KEY) {
     console.log(`  Auth: ENABLED (bearer token)`);
   } else {
