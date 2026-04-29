@@ -145,7 +145,7 @@ async function ocrGemini(imageBuffer, mimeType, prompt) {
     }],
     generationConfig: {
       temperature: 0.1,
-      maxOutputTokens: 2048,
+      maxOutputTokens: 4096,
       responseMimeType: 'application/json'
     }
   };
@@ -178,63 +178,7 @@ async function ocrGemini(imageBuffer, mimeType, prompt) {
   }
 }
 
-// ── Provider: GLM (z.ai) ──
-async function ocrGLM(imageBuffer, mimeType, prompt) {
-  const apiKey = process.env.GLM_API_KEY;
-  if (!apiKey) throw new Error('GLM_API_KEY not set');
 
-  const baseUrl = process.env.GLM_BASE_URL || 'https://api.z.ai/api/coding/paas/v4';
-  const model = process.env.GLM_MODEL || 'glm-4.6v-flash';
-  const base64 = imageBuffer.toString('base64');
-
-  const body = {
-    model,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } },
-        { type: 'text', text: prompt }
-      ]
-    }],
-    temperature: 0.1,
-    max_tokens: 2048
-  };
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      console.error(`[GLM] ${res.status}: ${err.slice(0, 500)}`);
-      throw new Error(`Upstream API error`);
-    }
-
-    const data = await res.json();
-    // GLM-4.6V returns answers in reasoning_content, not content
-    const text = data?.choices?.[0]?.message?.content
-      || data?.choices?.[0]?.message?.reasoning_content
-      || '';
-    if (!text) throw new Error('Upstream returned empty response');
-
-    return parseJSON(text);
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Upstream request timed out');
-    throw err;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
 
 // ── JSON Parser (handles markdown fences, extra text) ──
 function parseJSON(text) {
@@ -285,10 +229,6 @@ function getProviders() {
     gemini: {
       ready: !!process.env.GEMINI_API_KEY,
       model: process.env.GEMINI_MODEL || 'gemini-2.5-flash'
-    },
-    glm: {
-      ready: !!process.env.GLM_API_KEY,
-      model: process.env.GLM_MODEL || 'glm-4.6v-flash'
     }
   };
 }
@@ -312,37 +252,16 @@ app.post('/api/ocr', authMiddleware, rateLimiter, upload.single('image'), async 
     return res.status(400).json({ success: false, error: `Prompt too long. Maximum ${MAX_PROMPT_LENGTH} characters.` });
   }
 
-  let provider = (req.body.provider || DEFAULT_PROVIDER).toLowerCase();
+  const provider = 'gemini';
 
-  if (provider !== 'gemini' && provider !== 'glm') {
-    return res.status(400).json({ success: false, error: `Unknown provider: ${provider}. Use "gemini" or "glm".` });
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(503).json({ success: false, error: 'GEMINI_API_KEY not configured.' });
   }
 
   try {
-    let data;
-    let model;
-
-    if (provider === 'gemini') {
-      if (!process.env.GEMINI_API_KEY) {
-        // Fallback to GLM if Gemini not configured
-        console.log('[OCR] Gemini not configured, falling back to GLM');
-        provider = 'glm';
-      }
-    }
-
-    if (provider === 'glm' && !process.env.GLM_API_KEY) {
-      return res.status(503).json({ success: false, error: 'No API key configured. Set GEMINI_API_KEY or GLM_API_KEY.' });
-    }
-
-    if (provider === 'gemini') {
-      model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-      console.log(`[OCR] Using Gemini: ${model}`);
-      data = await ocrGemini(req.file.buffer, req.file.mimetype, prompt);
-    } else {
-      model = process.env.GLM_MODEL || 'glm-4.6v-flash';
-      console.log(`[OCR] Using GLM: ${model}`);
-      data = await ocrGLM(req.file.buffer, req.file.mimetype, prompt);
-    }
+    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+    console.log(`[OCR] Using Gemini: ${model}`);
+    const data = await ocrGemini(req.file.buffer, req.file.mimetype, prompt);
 
     const duration = Date.now() - start;
     console.log(`[OCR] ${provider}/${model} — ${duration}ms`);
@@ -369,8 +288,7 @@ app.listen(PORT, () => {
   const providers = getProviders();
   const ready = Object.values(providers).filter(p => p.ready).map(p => p.model);
   console.log(`\n  OCR Service running on port ${PORT}`);
-  console.log(`  Providers ready: ${ready.length > 0 ? ready.join(', ') : 'NONE — set API keys in .env'}`);
-  console.log(`  Default: ${DEFAULT_PROVIDER}`);
+  console.log(`  Provider: ${ready.length > 0 ? ready.join(', ') : 'NONE — set GEMINI_API_KEY in .env'}`);
   if (API_KEY) {
     console.log(`  Auth: ENABLED (bearer token)`);
   } else {
