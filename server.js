@@ -121,7 +121,8 @@ async function ocrGemini(imageBuffer, mimeType, prompt) {
     generationConfig: {
       temperature: 0.1,
       maxOutputTokens: 4096,
-      responseMimeType: 'application/json'
+      responseMimeType: 'application/json',
+      thinkingConfig: { thinkingBudget: 512 }
     }
   };
 
